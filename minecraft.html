@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <title>Minecraft Világ - Véletlen Bányák és Élőlények</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87ceeb; }
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 4px;
+            height: 4px;
+            border: 1px solid white;
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+</head>
+<body>
+    <div id="crosshair"></div>
+
+    <script>
+        // --- Játék Konfiguráció ---
+        const BLOCK_SIZE = 1;
+        const MOVEMENT_SPEED = 7;
+        const JUMP_VELOCITY = 6;
+        const PLAYER_HEIGHT = 1.8;
+        const FIXED_TIME_STEP = 1.0 / 60.0; 
+        const GROUND_SIZE = 200;
+        const MOUSE_SENSITIVITY = 0.002;
+
+        // --- Élőlény Konfiguráció ---
+        const PIG_MOVEMENT_SPEED = 2;
+        const PIG_WANDER_TIME = 2000;
+        const PIG_MATERIAL = new THREE.MeshLambertMaterial({ color: 0xf5c3c3 }); // Rózsaszín (malac)
+        const pigs = [];
+        const NUM_PIGS = 3; // Hány malac legyen
+        const NUM_MINES = 5; // Hány bánya bejárat legyen
+
+        // --- THREE.JS (Grafika) Beállítások ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+        scene.background = new THREE.Color(0x87ceeb);
+
+        // Fények
+        scene.add(new THREE.AmbientLight(0x404040, 2));
+        const sun = new THREE.DirectionalLight(0xffffff, 1);
+        sun.position.set(50, 100, 50);
+        scene.add(sun);
+
+        // --- CANNON.JS (Fizika) Beállítások ---
+        const world = new CANNON.World();
+        world.gravity.set(0, -9.82, 0);
+        let lastTime;
+        const blocks = [];
+
+        // --- Anyagok és Geometriák ---
+        const blockGeometry = new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+        const DIRT_MATERIAL = new THREE.MeshLambertMaterial({ color: 0x964b00 });
+        const LEAF_MATERIAL = new THREE.MeshLambertMaterial({ color: 0x558b2f });
+        const GRASS_MATERIAL = new THREE.MeshLambertMaterial({ color: 0x4f7942 });
+
+        // --- Térkép (Föld) Létrehozása ---
+        const groundShape = new CANNON.Box(new CANNON.Vec3(GROUND_SIZE / 2, 0.5, GROUND_SIZE / 2));
+        const groundBody = new CANNON.Body({ mass: 0, shape: groundShape });
+        groundBody.position.set(0, -0.5, 0);
+        world.addBody(groundBody);
+
+        const groundGeometry = new THREE.BoxGeometry(GROUND_SIZE, 1, GROUND_SIZE);
+        const groundMesh = new THREE.Mesh(groundGeometry, GRASS_MATERIAL);
+        groundMesh.position.copy(groundBody.position);
+        scene.add(groundMesh);
+
+        // --- Segédfüggvény: Blokk Hozzáadása ---
+        function addBlock(position, material) {
+            const newBlock = new THREE.Mesh(blockGeometry, material);
+            newBlock.position.copy(position);
+            scene.add(newBlock);
+            blocks.push(newBlock);
+            
+            const blockShape = new CANNON.Box(new CANNON.Vec3(BLOCK_SIZE / 2, BLOCK_SIZE / 2, BLOCK_SIZE / 2));
+            const blockBody = new CANNON.Body({ mass: 0, shape: blockShape });
+            blockBody.position.copy(position);
+            world.addBody(blockBody);
+
+            newBlock.userData.body = blockBody; 
+            newBlock.userData.material = material;
+        }
+
+        // --- Segédfüggvény: Fa Generátor ---
+        function generateTree(startX, startZ) {
+            const trunkHeight = 3;
+            for (let i = 0; i < trunkHeight; i++) {
+                addBlock(new THREE.Vector3(startX, i + 0.5, startZ), DIRT_MATERIAL);
+            }
+            
+            const leafY = trunkHeight;
+            for (let y = 0; y < 3; y++) {
+                for (let x = -1; x <= 1; x++) {
+                    for (let z = -1; z <= 1; z++) {
+                        if (y === 2 && (Math.abs(x) + Math.abs(z)) > 1) continue; 
+                        if (x === 0 && z === 0 && y < 2) continue; 
+                        addBlock(new THREE.Vector3(startX + x, leafY + y + 0.5, startZ + z), LEAF_MATERIAL);
+                    }
+                }
+            }
+        }
+        
+        // --- Segédfüggvény: Élőlény (Malac) Létrehozása ---
+        function addPig(position) {
+            const pigGeometry = new THREE.BoxGeometry(BLOCK_SIZE * 0.7, BLOCK_SIZE * 0.7, BLOCK_SIZE * 0.7);
+            const pigMesh = new THREE.Mesh(pigGeometry, PIG_MATERIAL);
+            pigMesh.position.copy(position);
+            scene.add(pigMesh);
+
+            const pigShape = new CANNON.Box(new CANNON.Vec3(BLOCK_SIZE * 0.35, BLOCK_SIZE * 0.35, BLOCK_SIZE * 0.35));
+            const pigBody = new CANNON.Body({ mass: 10, shape: pigShape }); 
+            pigBody.position.copy(position);
+            world.addBody(pigBody);
+            
+            pigBody.fixedRotation = true;
+
+            // AI adatok
+            pigBody.userData = {
+                mesh: pigMesh,
+                wanderTimer: 0,
+                direction: new CANNON.Vec3(0, 0, 0)
+            };
+            
+            pigs.push(pigBody);
+        }
+
+        // --- Segédfüggvény: Bánya (Aknaszerű bejárat) Létrehozása ---
+        function generateMineShaft(startX, startZ) {
+            // Lyuk fúrása a földbe (4 blokk mély)
+            for (let y = 0; y > -4; y--) {
+                const pos = new THREE.Vector3(startX, y + 0.5, startZ);
+
+                // Keressük meg, hogy van-e már blokk ezen a helyen (a fű vagy fa)
+                const blockToRemove = blocks.find(block => 
+                    Math.round(block.position.x) === startX && 
+                    Math.round(block.position.y) === y + 0.5 && 
+                    Math.round(block.position.z) === startZ
+                );
+
+                if (blockToRemove) {
+                    world.removeBody(blockToRemove.userData.body);
+                    scene.remove(blockToRemove);
+                    blocks.splice(blocks.indexOf(blockToRemove), 1);
+                }
+            }
+        }
+        
+        // --- Segédfüggvény: Véletlenszerű Bánya Generálás ---
+        function generateMineShaftsRandomly(count) {
+            const halfSize = GROUND_SIZE / 2;
+            for (let i = 0; i < count; i++) {
+                // Véletlen X és Z koordináták a GROUND_SIZE határain belül
+                const randomX = Math.floor(Math.random() * GROUND_SIZE) - halfSize;
+                const randomZ = Math.floor(Math.random() * GROUND_SIZE) - halfSize;
+                
+                generateMineShaft(randomX, randomZ);
+            }
+        }
+        
+        // --- Segédfüggvény: Véletlenszerű Élőlény Generálás ---
+        function generatePigsRandomly(count) {
+            const halfSize = GROUND_SIZE / 2;
+            for (let i = 0; i < count; i++) {
+                // Véletlen X és Z koordináták a GROUND_SIZE határain belül
+                const randomX = Math.floor(Math.random() * GROUND_SIZE) - halfSize;
+                const randomZ = Math.floor(Math.random() * GROUND_SIZE) - halfSize;
+                
+                // Y=1.0 - a malac lába a földön van (0.5 mély a fű)
+                addPig(new THREE.Vector3(randomX, 1.0, randomZ));
+            }
+        }
+
+
+        // --- Világ Generálása ---
+        generateTree(15, 15);
+        generateTree(-10, -20);
+        generateTree(5, -15);
+        addBlock(new THREE.Vector3(2, 0.5, 5), DIRT_MATERIAL); 
+        addBlock(new THREE.Vector3(3, 1.5, 5), DIRT_MATERIAL);
+        
+        // Malacok elhelyezése véletlenszerűen
+        generatePigsRandomly(NUM_PIGS);
+
+        // Bánya bejáratok elhelyezése véletlenszerűen
+        generateMineShaftsRandomly(NUM_MINES); 
+        
+        // --- Játékos Létrehozása ---
+        const playerShape = new CANNON.Cylinder(0.5, 0.5, PLAYER_HEIGHT, 16);
+        const playerBody = new CANNON.Body({ mass: 70, shape: playerShape });
+        playerBody.position.set(0, 5, 0);
+        playerBody.fixedRotation = true; 
+        world.addBody(playerBody);
+        camera.position.set(0, PLAYER_HEIGHT / 2, 0);
+        
+        // --- Játékos Mozgása (Jobbra/Balra Forgás) ---
+        let playerQuaternion = new THREE.Quaternion();
+        let euler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+        // --- Mozgás Kezelése ---
+        let controls = { w: false, a: false, s: false, d: false, space: false };
+        let isJumping = false; 
+
+        document.addEventListener('keydown', (e) => {
+            if (document.pointerLockElement !== renderer.domElement) return;
+            switch(e.key.toLowerCase()) {
+                case 'w': controls.w = true; break;
+                case 's': controls.s = true; break;
+                case 'a': controls.a = true; break;
+                case 'd': controls.d = true; break;
+                case ' ': if (!isJumping) controls.space = true; break;
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            switch(e.key.toLowerCase()) {
+                case 'w': controls.w = false; break;
+                case 's': controls.s = false; break;
+                case 'a': controls.a = false; break;
+                case 'd': controls.d = false; break;
+                case ' ': controls.space = false; break;
+            }
+        });
+
+        playerBody.addEventListener('collide', (e) => {
+            if (e.body === groundBody || blocks.some(b => b.userData.body === e.body)) {
+                if (playerBody.velocity.y < 0) {
+                    isJumping = false;
+                }
+            }
+        });
+
+        function updateMovement() {
+            const yVelocity = playerBody.velocity.y;
+            playerBody.velocity.set(0, yVelocity, 0);
+
+            let direction = new THREE.Vector3(0, 0, -1);
+            direction.applyQuaternion(playerQuaternion); 
+            direction.y = 0; 
+            direction.normalize();
+
+            let right = new THREE.Vector3().crossVectors(direction, new THREE.Vector3(0, 1, 0)).normalize();
+
+            if (controls.w) { playerBody.velocity.x += direction.x * MOVEMENT_SPEED; playerBody.velocity.z += direction.z * MOVEMENT_SPEED; }
+            if (controls.s) { playerBody.velocity.x -= direction.x * MOVEMENT_SPEED; playerBody.velocity.z -= direction.z * MOVEMENT_SPEED; }
+            if (controls.a) { playerBody.velocity.x -= right.x * MOVEMENT_SPEED; playerBody.velocity.z -= right.z * MOVEMENT_SPEED; }
+            if (controls.d) { playerBody.velocity.x += right.x * MOVEMENT_SPEED; playerBody.velocity.z += right.z * MOVEMENT_SPEED; }
+
+            if (controls.space && !isJumping) {
+                playerBody.velocity.y = JUMP_VELOCITY;
+                isJumping = true; 
+            }
+        }
+
+        // --- Egér Forgatás ---
+        renderer.domElement.addEventListener('click', () => {
+            renderer.domElement.requestPointerLock();
+        });
+        
+        document.addEventListener('contextmenu', (e) => {
+            if (document.pointerLockElement === renderer.domElement) {
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (document.pointerLockElement === renderer.domElement) {
+                const movementX = e.movementX;
+                const movementY = e.movementY;
+
+                // Függőleges forgatás
+                euler.x -= movementY * MOUSE_SENSITIVITY;
+                euler.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, euler.x));
+                
+                // Vízszintes forgatás
+                euler.y -= movementX * MOUSE_SENSITIVITY;
+                
+                playerQuaternion.setFromEuler(euler);
+                camera.rotation.copy(euler);
+                playerBody.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), euler.y);
+            }
+        });
+
+        // --- Interakció (Építés/Törés) ---
+        const raycaster = new THREE.Raycaster();
+        const pointer = new THREE.Vector2(0, 0); // Célkereszt
+        
+        document.addEventListener('mousedown', (e) => {
+            if (document.pointerLockElement !== renderer.domElement) return;
+
+            raycaster.setFromCamera(pointer, camera);
+            const intersectableObjects = blocks.concat(groundMesh);
+            const intersects = raycaster.intersectObjects(intersectableObjects);
+            
+            if (intersects.length > 0) {
+                const intersection = intersects[0];
+                const targetMesh = intersection.object;
+
+                // 1. Törés: Bal egérgomb (0)
+                if (e.button === 0 && targetMesh !== groundMesh) {
+                    world.removeBody(targetMesh.userData.body);
+                    scene.remove(targetMesh);
+                    blocks.splice(blocks.indexOf(targetMesh), 1);
+                } 
+                // 2. Építés: Jobb egérgomb (2)
+                else if (e.button === 2) {
+                    const normal = intersection.face.normal.clone();
+                    normal.transformDirection(targetMesh.matrixWorld);
+                    normal.multiplyScalar(BLOCK_SIZE); 
+
+                    const newBlockPos = intersection.point.clone().add(normal);
+
+                    // Rácshoz igazítás (snap to grid)
+                    const finalPos = new THREE.Vector3(
+                        Math.round(newBlockPos.x),
+                        Math.round(newBlockPos.y),
+                        Math.round(newBlockPos.z)
+                    );
+
+                    // --- ELLENŐRZÉS: NEM ÉPÍTHET A KARAKTER POZÍCIÓJÁRA ---
+                    
+                    const pX = Math.round(playerBody.position.x);
+                    const pY_center = Math.round(playerBody.position.y);
+                    const pZ = Math.round(playerBody.position.z);
+                    
+                    const pY_foot = pY_center - 1; 
+                    const pY_head = pY_center;    
+                    
+                    const isPlayerCollision = (
+                        finalPos.x === pX && finalPos.z === pZ && 
+                        (finalPos.y === pY_foot || finalPos.y === pY_head)
+                    );
+
+                    if (!isPlayerCollision) {
+                         addBlock(finalPos, DIRT_MATERIAL);
+                    } else {
+                        console.log("Nem építhetsz a saját testedbe!");
+                    }
+                }
+            }
+        }, false);
+
+        // --- Animációs Ciklus (Game Loop) ---
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            if (lastTime !== undefined) {
+                const delta = (time - lastTime) / 1000;
+                
+                world.step(FIXED_TIME_STEP, delta);
+                updateMovement();
+                
+                // --- Malac AI frissítése ---
+                for (const pigBody of pigs) {
+                    const data = pigBody.userData;
+                    
+                    // Frissítjük az AI időzítőt
+                    data.wanderTimer -= delta * 1000; 
+
+                    if (data.wanderTimer <= 0) {
+                        // Új véletlenszerű irányt és időzítőt választ
+                        data.wanderTimer = Math.random() * PIG_WANDER_TIME + 1000;
+                        
+                        // Véletlenszerű irány XZ síkon
+                        const angle = Math.random() * Math.PI * 2;
+                        data.direction.x = Math.cos(angle) * PIG_MOVEMENT_SPEED;
+                        data.direction.z = Math.sin(angle) * PIG_MOVEMENT_SPEED;
+                    }
+                    
+                    // Alkalmazzuk a mozgást
+                    pigBody.velocity.x = data.direction.x;
+                    pigBody.velocity.z = data.direction.z;
+                    
+                    // Szinkronizáljuk a grafikát a fizikai testtel
+                    data.mesh.position.copy(pigBody.position);
+                    data.mesh.quaternion.copy(pigBody.quaternion);
+                }
+                
+                // Kamera pozíciója
+                camera.position.x = playerBody.position.x;
+                camera.position.y = playerBody.position.y + PLAYER_HEIGHT / 2;
+                camera.position.z = playerBody.position.z;
+                
+                // Blokk pozíciók szinkronizálása
+                for (const block of blocks) {
+                    if (block.userData.body) {
+                        block.position.copy(block.userData.body.position);
+                        block.quaternion.copy(block.userData.body.quaternion);
+                    }
+                }
+            }
+            lastTime = time;
+
+            renderer.render(scene, camera);
+        }
+
+        // Ablakméret kezelése
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
